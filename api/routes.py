@@ -109,6 +109,10 @@ def predict(body: PredictionRequest):
         over_25=round(r["over_25"], 4),
         btts=round(r["btts"], 4),
         pool_method=r.get("pool_method"),
+        handicap_2=r.get("handicap_2"),
+        top10_scores=r.get("top10_scores"),
+        recent_matches=r.get("recent_matches"),
+        trace=r.get("trace"),
     )
 
 
@@ -440,6 +444,73 @@ def get_team_history(
 def list_tournaments(db: Session = Depends(get_db)):
     rows = db.execute(
         text("SELECT id, name, tier FROM tournaments ORDER BY name")
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+#  WC 2026 Squad queries
+# ============================================================================
+
+@router.get("/squad/teams")
+def squad_teams(db: Session = Depends(get_db)):
+    """List all WC 2026 teams in the squad database."""
+    rows = db.execute(
+        text("SELECT DISTINCT team_code, team_name FROM squad_players ORDER BY team_name")
+    ).mappings().all()
+    result = []
+    for r in rows:
+        top5 = db.execute(
+            text("SELECT COUNT(*) FROM squad_players WHERE team_code = :tc AND top5_league = 1"),
+            {"tc": r["team_code"]},
+        ).scalar()
+        result.append({"team_code": r["team_code"], "team_name": r["team_name"], "top5_count": top5})
+    return result
+
+
+@router.get("/squad/team/{team_code}")
+def squad_players(team_code: str, db: Session = Depends(get_db)):
+    """Get all players for a given team (e.g. ARG, BRA, FRA)."""
+    rows = db.execute(
+        text("""SELECT * FROM squad_players WHERE team_code = :tc ORDER BY jersey_number"""),
+        {"tc": team_code.upper()},
+    ).mappings().all()
+    coach = db.execute(
+        text("""SELECT * FROM squad_coaches WHERE team_code = :tc"""),
+        {"tc": team_code.upper()},
+    ).mappings().first()
+    if not rows:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Team {team_code} not found")
+    return {"team_code": team_code, "team_name": rows[0]["team_name"], "players": [dict(r) for r in rows], "coach": dict(coach) if coach else None}
+
+
+@router.get("/squad/top5-leagues")
+def squad_top5_leagues(db: Session = Depends(get_db)):
+    """Count of players in top-5 leagues per national team."""
+    rows = db.execute(
+        text("""
+            SELECT team_code, team_name,
+                   SUM(CASE WHEN top5_league THEN 1 ELSE 0 END) as top5_count,
+                   COUNT(*) as total_players
+            FROM squad_players
+            GROUP BY team_code, team_name
+            ORDER BY top5_count DESC
+        """)
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.get("/squad/player/search")
+def squad_player_search(name: str = Query(..., min_length=2), db: Session = Depends(get_db)):
+    """Search for a player by name across all teams."""
+    rows = db.execute(
+        text("""
+            SELECT * FROM squad_players
+            WHERE LOWER(player_name) LIKE :n OR LOWER(name_on_shirt) LIKE :n
+            ORDER BY team_code, jersey_number
+        """),
+        {"n": f"%{name.lower()}%"},
     ).mappings().all()
     return [dict(r) for r in rows]
 

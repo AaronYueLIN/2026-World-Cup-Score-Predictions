@@ -187,3 +187,49 @@ class TeamName(Base):
 
     def __repr__(self):
         return f"<TeamName {self.former_name} → {self.current_name}>"
+
+
+# ---------------------------------------------------------------------------
+# WC 2026 Squad Players
+# ---------------------------------------------------------------------------
+class SquadPlayer(Base):
+    __tablename__ = "squad_players"
+    __table_args__ = (
+        UniqueConstraint("team_code", "jersey_number", name="uq_squad_player_number"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    team_code: Mapped[str] = mapped_column(String(3), nullable=False, index=True)
+    team_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    jersey_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    position: Mapped[str] = mapped_column(String(3), nullable=False)
+    player_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    name_on_shirt: Mapped[str] = mapped_column(String(100), nullable=False)
+    dob: Mapped[str] = mapped_column(String(20), nullable=True)
+    club: Mapped[str] = mapped_column(String(200), nullable=False)
+    club_country: Mapped[str | None] = mapped_column(String(3))
+    height_cm: Mapped[int | None] = mapped_column(Integer)
+    caps: Mapped[int | None] = mapped_column(Integer)
+    goals: Mapped[int | None] = mapped_column(Integer)
+    top5_league: Mapped[bool] = mapped_column(default=False)
+
+    def __repr__(self):
+        return f"<SquadPlayer #{self.jersey_number} {self.player_name} ({self.team_code})>"
+
+
+class SquadCoach(Base):
+    __tablename__ = "squad_coaches"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    team_code: Mapped[str] = mapped_column(String(3), nullable=False, index=True)
+    team_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    role: Mapped[str] = mapped_column(String(50), nullable=False)
+    coach_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    nationality: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    def __repr__(self):
+        return f"<SquadCoach {self.coach_name} ({self.team_code})>"

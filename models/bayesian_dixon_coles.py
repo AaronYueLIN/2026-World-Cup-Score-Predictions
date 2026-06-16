@@ -510,7 +510,7 @@ class BayesianDixonColesModel:
     # ------------------------------------------------------------------
 
     def _lazy_load_ensemble(self):
-        """Load ensemble_v3.pkl (HistGBM, 40-dim rolling features). Uses registry unified path."""
+        """Load ensemble_v3.pkl + companion training data. Uses registry unified path."""
         if self._ensemble is not None:
             return
         try:
@@ -519,13 +519,22 @@ class BayesianDixonColesModel:
             if ens is None:
                 logger.warning("Ensemble pkl not found in registry — skipping")
                 return
-            # Attach scoreline to old dc_model inside ensemble (didn't exist at pickle time)
-            if hasattr(ens, "dc_model") and not hasattr(ens.dc_model, "_scoreline_model"):
-                try:
-                    ens.dc_model._init_scoreline()
-                except Exception:
-                    pass
             self._ensemble = ens
+
+            # Restore training data from companion file if not already loaded
+            fit_df = getattr(self, "_fit_df", None)
+            if fit_df is None:
+                import os
+                companion = os.path.join(os.path.dirname(__file__), "ensemble_data.parquet")
+                if os.path.exists(companion):
+                    import pandas as pd
+                    self._fit_df = pd.read_parquet(companion)
+                    if "date" in self._fit_df.columns and not pd.api.types.is_datetime64_dtype(self._fit_df["date"]):
+                        self._fit_df["date"] = pd.to_datetime(self._fit_df["date"])
+                    logger.info("Ensemble training data loaded from %s", companion)
+                else:
+                    logger.warning("Ensemble companion data not found at %s — ensemble predict unavailable", companion)
+
             logger.info("Ensemble loaded via registry")
         except Exception as exc:
             logger.warning("Ensemble load failed (%s) — running DC only", exc)
@@ -629,13 +638,12 @@ class BayesianDixonColesModel:
     #  GAS Post-Fit — Fit time-varying dynamics on top of MAP anchor (ScoreDrivenStrength)
     # ------------------------------------------------------------------
 
-    def _fit_gas(self, df: "pd.DataFrame | None" = None, fix_B: float | None = 0.985):
+    def _fit_gas(self, df: "pd.DataFrame | None" = None, fix_B: float | None = 0.985, double_gas: bool = False):
         """Fit GAS time-varying dynamics on top of MAP anchor (ScoreDrivenStrength).
 
-        When df is not provided, automatically pulls full match data from SQL.
-        fix_B=0.985: B is fixed to held-out RPS optimal value, only A is optimized (source locked, prevents sliding to B->1 edge solution)
+        double_gas=True: runs two GAS layers (fast + slow) and blends their lambdas.
         """
-        from quantbet.scoreline.score_driven import ScoreDrivenStrength
+        from quantbet.scoreline.score_driven import ScoreDrivenStrength, DoubleGAS
 
         if df is None:
             from sqlalchemy import create_engine, text
@@ -656,17 +664,25 @@ class BayesianDixonColesModel:
             df["venue"] = df["venue"].fillna("neutral")
             df = df[df.home_team.isin(self.teams) & df.away_team.isin(self.teams)]
 
-        sd = ScoreDrivenStrength(
-            attack0={t: float(v) for t, v in zip(self.teams, self.params["attack"])},
-            defense0={t: float(v) for t, v in zip(self.teams, self.params["defense"])},
-            home_adj=float(self.params["home_adj"]),
-            neutral_adj=float(self.params["neutral_adj"]),
-        )
+        anchor_att = {t: float(v) for t, v in zip(self.teams, self.params["attack"])}
+        anchor_def = {t: float(v) for t, v in zip(self.teams, self.params["defense"])}
 
-        hyper = sd.fit_hyperparams(df, share_gain=True, fix_B=fix_B)
+        if double_gas:
+            sd = DoubleGAS(
+                anchor_att, anchor_def,
+                home_adj=float(self.params["home_adj"]),
+                neutral_adj=float(self.params["neutral_adj"]),
+            )
+        else:
+            sd = ScoreDrivenStrength(
+                anchor_att, anchor_def,
+                home_adj=float(self.params["home_adj"]),
+                neutral_adj=float(self.params["neutral_adj"]),
+            )
+
+        hyper = sd.fit_hyperparams(df, share_gain=True, fix_B=fix_B if not double_gas else None)
         self._gas_hyper = hyper
-        _log.info("gas_fit", A_att=hyper["A_att"], B=hyper["B"],
-                   neg_ll=round(hyper["neg_ll"], 1), n_matches=hyper["n_matches"])
+        _log.info("gas_fit", type=type(sd).__name__, hyper=hyper)
 
         sd.run(df, collect_oos=False)
         self._gas = sd
@@ -679,6 +695,33 @@ class BayesianDixonColesModel:
         if getattr(self, "_gas", None) is None:
             raise GasFitError("No GAS fit. Call fit() with GAS enabled first.")
         return self._gas.momentum_table()
+
+    def _recent_matches(self, team: str, n: int = 10) -> list[dict]:
+        """Return last N matches for a team from the persisted training data."""
+        df = getattr(self, "_fit_df", None)
+        if df is None:
+            return []
+        mask = (df["home_team"] == team) | (df["away_team"] == team)
+        recent = df[mask].tail(n).iloc[::-1]  # newest first
+        out = []
+        for _, r in recent.iterrows():
+            if r["home_team"] == team:
+                winner = team if r["home_goals"] > r["away_goals"] else (r["away_team"] if r["away_goals"] > r["home_goals"] else "draw")
+                out.append({
+                    "date": str(r["date"])[:10],
+                    "opponent": str(r["away_team"]),
+                    "score": f"{int(r['home_goals'])}-{int(r['away_goals'])}",
+                    "winner": winner,
+                })
+            else:
+                winner = team if r["away_goals"] > r["home_goals"] else (r["home_team"] if r["home_goals"] > r["away_goals"] else "draw")
+                out.append({
+                    "date": str(r["date"])[:10],
+                    "opponent": str(r["home_team"]),
+                    "score": f"{int(r['away_goals'])}-{int(r['home_goals'])}",
+                    "winner": winner,
+                })
+        return out
 
     # ------------------------------------------------------------------
     #  Prediction
@@ -762,41 +805,110 @@ class BayesianDixonColesModel:
         dc_weight = 1.0
         if not hasattr(self, "_ensemble"):
             self._ensemble = None
-        if self._ensemble is None and hasattr(self, "max_goals") and self.max_goals:
-            try:
-                self._lazy_load_ensemble()
-            except Exception:
-                pass
 
-        if self._ensemble is not None:
-            P_gbm = None
+        # Guard: _loading_ensemble stays True across both loading AND ensemble predict
+        # so FeatureEngineer._dc_features -> self.predict() won't recurse.
+        if getattr(self, "_loading_ensemble", False):
+            pass
+        else:
+            self._loading_ensemble = True
             try:
-                # Ensemble needs historical df to compute rolling features + h2h
-                df_ens = getattr(self, "_fit_df", None)
-                if df_ens is None:
-                    logger.warning("predict: _fit_df not persisted, skipping ensemble")
-                    raise RuntimeError("No persisted df for ensemble")
-                gbm_r = self._ensemble.predict(home_team, away_team, df=df_ens, venue=venue)
-                P_gbm = np.array([gbm_r["ensemble"]["home_win_prob"],
-                                  gbm_r["ensemble"]["draw_prob"],
-                                  gbm_r["ensemble"]["away_win_prob"]], dtype=float)
-            except Exception as exc:
-                logger.warning("Ensemble predict failed: %s", exc)
+                if self._ensemble is None and hasattr(self, "max_goals") and self.max_goals:
+                    self._lazy_load_ensemble()
 
-            if P_gbm is not None:
-                from quantbet.pooling import log_pool
-                P_dc = np.array([home_win, draw, away_win], dtype=float)
-                w = float(self._ensemble_weight)
-                P_pooled = log_pool([P_dc, P_gbm], [w, 1.0 - w])
-                home_win, draw, away_win = float(P_pooled[0]), float(P_pooled[1]), float(P_pooled[2])
-                pool_method = "log"
-                dc_weight = w
+                if self._ensemble is not None:
+                    P_gbm = None
+                    try:
+                        df_ens = getattr(self, "_fit_df", None)
+                        if df_ens is None:
+                            logger.warning("predict: _fit_df not persisted, skipping ensemble")
+                            raise RuntimeError("No persisted df for ensemble")
+                        if "date" in df_ens.columns and not pd.api.types.is_datetime64_dtype(df_ens["date"]):
+                            df_ens = df_ens.copy()
+                            df_ens["date"] = pd.to_datetime(df_ens["date"])
+
+                        ens = self._ensemble
+                        if isinstance(ens, dict):
+                            fe = ens.get("feature_engineer")
+                            gbm = ens.get("gbm_model")
+                            w = float(ens.get("dc_weight", 0.695))
+                            if fe is not None and gbm is not None:
+                                feat = fe.get_match_features(
+                                    df_ens, home_team, away_team,
+                                    before_date=df_ens["date"].max() + pd.Timedelta(days=1),
+                                    dc_model=self, venue=venue,
+                                )
+                                gbm_p = gbm.predict_proba_from_features(feat)
+                                P_gbm = gbm_p
+                                dc_weight = w
+                        else:
+                            gbm_r = ens.predict(home_team, away_team, df=df_ens, venue=venue)
+                            P_gbm = np.array([gbm_r["ensemble"]["home_win_prob"],
+                                              gbm_r["ensemble"]["draw_prob"],
+                                              gbm_r["ensemble"]["away_win_prob"]], dtype=float)
+                            dc_weight = float(getattr(ens, "dc_weight", 0.695))
+                    except Exception as exc:
+                        logger.warning("Ensemble predict failed: %s", exc)
+
+                    if P_gbm is not None:
+                        from quantbet.pooling import log_pool
+                        P_dc = np.array([home_win, draw, away_win], dtype=float)
+                        w = dc_weight  # already set from ensemble dict
+                        P_pooled = log_pool([P_dc, P_gbm], [w, 1.0 - w])
+                        home_win, draw, away_win = float(P_pooled[0]), float(P_pooled[1]), float(P_pooled[2])
+                        pool_method = "log"
+                        dc_weight = w
+            finally:
+                self._loading_ensemble = False
 
         score_probs = {
             f"{h}-{a}": round(float(score_matrix[h, a]), 4)
             for h in range(self.max_goals + 1)
             for a in range(self.max_goals + 1)
             if score_matrix[h, a] >= 0.005
+        }
+
+        # Top 10 exact scores
+        top10 = dict(sorted(score_probs.items(), key=lambda x: -x[1])[:10])
+
+        # Asian handicap -2 (home gives 2 goals)
+        # Home covers: home goals - away goals > 2
+        # Push:        home goals - away goals == 2
+        # Away covers: home goals - away goals < 2
+        goal_diff = np.subtract.outer(np.arange(n), np.arange(n))
+        hcap_home = float(score_matrix[goal_diff > 2].sum())
+        hcap_push = float(score_matrix[goal_diff == 2].sum())
+        hcap_away = float(score_matrix[goal_diff < 2].sum())
+
+        # Recent 10 matches
+        recent = {}
+        for side, team in [("home", home_team), ("away", away_team)]:
+            recent[side] = self._recent_matches(team, 10)
+
+        # Calculation trace
+        h_idx = self.team_idx[home_team]
+        a_idx = self.team_idx[away_team]
+        att_h = float(self.params["attack"][h_idx])
+        def_h = float(self.params["defense"][h_idx])
+        att_a = float(self.params["attack"][a_idx])
+        def_a = float(self.params["defense"][a_idx])
+        gas = getattr(self, "_gas", None)
+        gas_delta_h = 0.0
+        gas_delta_a = 0.0
+        if gas is not None:
+            mt = gas.momentum_table().set_index("team")
+            gas_delta_h = float(mt.loc[home_team, "momentum"]) if home_team in mt.index else 0.0
+            gas_delta_a = float(mt.loc[away_team, "momentum"]) if away_team in mt.index else 0.0
+        trace = {
+            "att_home": round(att_h, 4),
+            "def_home": round(def_h, 4),
+            "att_away": round(att_a, 4),
+            "def_away": round(def_a, 4),
+            "gas_delta_home": round(gas_delta_h, 4),
+            "gas_delta_away": round(gas_delta_a, 4),
+            "lambda_home": round(lambda_h, 3),
+            "lambda_away": round(lambda_a, 3),
+            "calibrator_temp": round(float(getattr(self._calibrator, "temp_", 1.0)), 4) if getattr(self, "_calibrator", None) else None,
         }
 
         return {
@@ -812,6 +924,14 @@ class BayesianDixonColesModel:
             "dc_weight":           round(dc_weight, 3),
             "over_25":             round(over_25, 4),
             "btts":                round(btts, 4),
+            "handicap_2": {
+                "home": round(hcap_home, 4),
+                "push": round(hcap_push, 4),
+                "away": round(hcap_away, 4),
+            },
+            "top10_scores":        top10,
+            "recent_matches":      recent,
+            "trace":               trace,
             "score_probs":         score_probs,
             "score_matrix":        score_matrix,
         }

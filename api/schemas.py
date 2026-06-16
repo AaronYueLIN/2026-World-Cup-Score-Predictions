@@ -91,6 +91,10 @@ class PredictionResponse(BaseModel):
     model_version: str = "v9"
     gas_b: float = 0.985
     pool_method: Optional[str] = None
+    handicap_2: Optional[dict] = None
+    top10_scores: Optional[dict] = None
+    recent_matches: Optional[dict] = None
+    trace: Optional[dict] = None
 
     model_config = {"protected_namespaces": ()}
 

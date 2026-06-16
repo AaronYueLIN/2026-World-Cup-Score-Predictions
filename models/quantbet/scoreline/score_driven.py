@@ -318,3 +318,124 @@ class ScoreDrivenStrength:
         return (pd.DataFrame(recs)
                 .sort_values("momentum", ascending=False)
                 .reset_index(drop=True))
+
+
+# =====================================================================
+#  DoubleGAS — Two-speed adaptive strength layer
+# =====================================================================
+
+class DoubleGAS:
+    """Two GAS layers: fast (short-term form) + slow (long-term trend).
+
+    Blends two ScoreDrivenStrength instances with complementary B values:
+      - fast:  lower B (e.g. 0.96), higher A — catches form swings
+      - slow:  higher B (e.g. 0.99), lower A — long-term trend
+
+    API mirrors ScoreDrivenStrength (expected_goals / run / momentum_table)
+    so it is a drop-in replacement for dc._gas.
+    """
+
+    def __init__(
+        self,
+        attack0: dict[str, float],
+        defense0: dict[str, float],
+        home_adj: float = 0.25,
+        neutral_adj: float = 0.10,
+        slow_gain: float = 0.06,
+        fast_gain: float = 0.15,
+        slow_persistence: float = 0.985,
+        fast_persistence: float = 0.96,
+        slow_weight: float = 0.7,
+        **kwargs,
+    ) -> None:
+        self.slow = ScoreDrivenStrength(
+            attack0, defense0,
+            home_adj=home_adj, neutral_adj=neutral_adj,
+            gain_att=slow_gain, gain_def=slow_gain, persistence=slow_persistence,
+        )
+        self.fast = ScoreDrivenStrength(
+            attack0, defense0,
+            home_adj=home_adj, neutral_adj=neutral_adj,
+            gain_att=fast_gain, gain_def=fast_gain, persistence=fast_persistence,
+        )
+        self.slow_weight = slow_weight
+        # Mirror attributes so downstream code reads them from either layer
+        self.mu_att = attack0
+        self.mu_def = defense0
+        self.home_adj = home_adj
+        self.neutral_adj = neutral_adj
+        self.A_att = slow_gain
+        self.A_def = slow_gain
+        self.B = slow_persistence
+
+    def _blend(self, home: str, away: str, venue: str) -> tuple[float, float]:
+        """Return blended (lh, la) = slow_weight * lh_slow + (1 - slow_weight) * lh_fast."""
+        lh_s, la_s = self.slow.expected_goals(home, away, venue)
+        lh_f, la_f = self.fast.expected_goals(home, away, venue)
+        w = self.slow_weight
+        return lh_s * w + lh_f * (1 - w), la_s * w + la_f * (1 - w)
+
+    def expected_goals(
+        self, home: str, away: str, venue: str = "neutral",
+        as_of: pd.Timestamp | None = None,
+    ) -> tuple[float, float]:
+        """Drop-in for ScoreDrivenStrength.expected_goals()."""
+        # Decay both layers to as_of
+        for gas in (self.slow, self.fast):
+            sh = gas._ensure(home)
+            sa = gas._ensure(away)
+            sh._mu_att = gas.mu_att.get(home, 0)
+            sh._mu_def = gas.mu_def.get(home, 0)
+            sa._mu_att = gas.mu_att.get(away, 0)
+            sa._mu_def = gas.mu_def.get(away, 0)
+            gas._decay(sh, as_of)
+            gas._decay(sa, as_of)
+        return self._blend(home, away, venue)
+
+    def step(
+        self, home: str, away: str, gh: int, ga: int,
+        venue: str = "neutral", date: pd.Timestamp | None = None,
+    ) -> None:
+        for gas in (self.slow, self.fast):
+            gas.step(home, away, gh, ga, venue, date)
+
+    def run(self, df: pd.DataFrame, collect_oos: bool = True) -> pd.DataFrame | None:
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        rows = []
+        for _, r in df.iterrows():
+            venue = r.get("venue", "neutral")
+            date = r["date"]
+            ht, at = r["home_team"], r["away_team"]
+            lh, la = self.expected_goals(ht, at, venue, date)
+            if collect_oos:
+                rows.append({
+                    "date": date, "home_team": ht, "away_team": at,
+                    "pred_lambda_h": lh, "pred_lambda_a": la,
+                    "home_goals": r["home_goals"], "away_goals": r["away_goals"],
+                })
+            self.step(ht, at, int(r["home_goals"]), int(r["away_goals"]), venue, date)
+        return pd.DataFrame(rows) if collect_oos else None
+
+    def fit_hyperparams(
+        self, df: pd.DataFrame, share_gain: bool = True, fix_B: float | None = None,
+    ) -> dict:
+        """Fit both GAS layers independently, return combined result."""
+        slow_h = self.slow.fit_hyperparams(df, share_gain, fix_B if fix_B is not None else 0.985)
+        fast_h = self.fast.fit_hyperparams(df, share_gain, fix_B if fix_B is not None else 0.96)
+        fast_h["A_att"] = 0.15
+        fast_h["A_def"] = 0.15
+        return {"slow": slow_h, "fast": fast_h, "slow_weight": self.slow_weight}
+
+    def momentum_table(self) -> pd.DataFrame:
+        """Combined momentum: slow + fast deltas."""
+        slow_df = self.slow.momentum_table().set_index("team")
+        fast_df = self.fast.momentum_table().set_index("team")
+        combined = slow_df[["d_att", "d_def"]].copy()
+        combined["d_att"] = slow_df["d_att"] + fast_df["d_att"]
+        combined["d_def"] = slow_df["d_def"] + fast_df["d_def"]
+        combined["momentum"] = combined["d_att"] - combined["d_def"]
+        combined = combined.sort_values("momentum", ascending=False).reset_index()
+        combined.columns = ["team", "d_att", "d_def", "momentum"]
+        return combined
