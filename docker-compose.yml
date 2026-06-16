@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: quantbet
+      POSTGRES_USER: quantbet
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
+      - "-c"
+      - "pg_stat_statements.max=10000"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantbet"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://quantbet:${DB_PASSWORD}@db:5432/quantbet
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./db:/app/db
+      - ./models:/app/models
+      - ./scripts:/app/scripts
+      - ./api:/app/api
+
+volumes:
+  pgdata:

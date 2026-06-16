@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Database (local)
+quantbet.db
+*.db
+
+# Logs
+logs/
+*.log
+
+# Output
+output/
+
+# Environment
+.env
+.env.prod
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old model versions (keep only v6_clean)
+models/wc_2026_dixon_coles*.pkl
+models/bayesian_dc_v[1-5].pkl
+models/bayesian_dc_v6.pkl
+models/ensemble_v[12].pkl
+models/wc_2026_bayesian_v4.pkl
+
+# Old data versions
+data/wc_2026_48_full_v[2-5].csv
+data/wc_2026_48_full_v6.csv
+data/wc_2026_48_no_today.csv
+data/wc_2026_48_filtered.csv
+data/wc_2026_kaggle.csv
+data/mock_*.csv
+data/intl_*.html
+data/hist_*.html
+data/2026_*.html
+data/2026_*.txt
+data/kr_*
+data/sa_*
+data/cz_*
+data/all_2025_2026.txt
+data/wc_2026_coverage.txt
+data/wc_2026_groups.txt
+data/*_pred.txt
+data/recent_20_*.txt
+data/site_*.html
+data/wiki_*.html
+data/google_*.html
+data/bing_*.html
+data/fdorg/
+data/internationals.xlsx
+data/worldcup_matches*.csv
+
+# Old scripts (analysis one-offs)
+scripts/analyze_*.py
+scripts/strategy_20yuan*.py
+scripts/generate_bet_slip.py
+scripts/retrain_with_real_data.py
+scripts/worldcup_mode.py
+scripts/optimal_parlay_v2.py
+scripts/pred_ger_cur.py
+scripts/parlay_4fold.py
+
+# pytest cache
+.pytest_cache/
+
+# Temp
+*.tmp
+tmp/
+*.pkl
+!models/bayesian_dc_v9.pkl
+tests/test_pymc_fit.py
+tests/train_v7_full.py
+tests/train_v7_pymc.py
+.github/workflows/ci.yml

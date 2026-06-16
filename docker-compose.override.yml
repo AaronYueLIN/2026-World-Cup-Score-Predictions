@@ -1,0 +1,26 @@
+# Dev override — docker compose auto-loads this file
+# Usage: docker compose up (auto-merges docker-compose.yml + this file)
+# Production: docker compose -f docker-compose.yml up (does not load this file)
+
+services:
+  api:
+    # Development: don't build image, directly mount source code
+    build: .
+    # Hot reload
+    command: uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      APP_ENV: development
+      DATABASE_URL: sqlite:///quantbet.db
+    volumes:
+    # Mount source directories — auto-reload on change
+      - ./api:/app/api
+      - ./db:/app/db
+      - ./models:/app/models
+      - ./scripts:/app/scripts
+      # SQLite database file persistence
+      - ./quantbet.db:/app/quantbet.db
+
+  db:
+    # Development: PostgreSQL not needed — API connects directly to SQLite
+    profiles:
+      - production

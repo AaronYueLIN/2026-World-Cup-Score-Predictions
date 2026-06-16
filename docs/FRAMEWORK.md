@@ -1,0 +1,448 @@
+# QuantBet-EV v9.0 — Framework Book
+
+> Football Quantitative Value Investing and Automated Decision System
+> Version: 9.0.0 · 17,841 lines of source code · 97 Python modules · 2026-06-15
+
+---
+
+## 1. Project Overview
+
+### 1.1 Objective
+
+QuantBet-EV is an end-to-end football prediction and quantitative betting decision system. Input two team names, output: probability distribution (1X2 + exact score), last 10 matches for both teams, expected goals, algorithm derivation process. Under the hood, a Bayesian statistical model captures features of "sparse data, weak negative correlation" in international tournaments like the World Cup, and calculates +EV and optimal Kelly stakes after incorporating market odds.
+
+### 1.2 Core Pipeline
+
+```
+Data Source(SQL) → ELO Rating(eloratings.net) → PyMC find_MAP → 
+NB/Frank Score Matrix → Dynamic Strength Filter → Temperature Calibration → 
+1X2 + Score Probabilities → World Ranking(Continental) → Tournament Simulation → Value Assessment
+```
+
+### 1.3 Version History
+
+| Version | Core Change | Commit |
+|---|---|---|---|
+| v6.0 | Bayesian DC + SLSQP MAP (baseline) | `1baf4b7` |
+| v7.0 | SQL Data Platform + FastAPI + Security Hardening | `e258476` |
+| v7.5 | Pooling Fix + OOF Time Series (ml_predictor) | Mixed |
+| v8.0 | NB/Frank replaces Poisson+τ, scoreline module | `cf49732` |
+| **v9.0** | **ELO Database + RatingPrior + ConfederationPrior + 1y Momentum + Dynamic Strength + Calibration** | `88d7e00`+`a462cda` |
+
+---
+
+## 2. Technical Architecture
+
+### 2.1 System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       External Data Sources                                   │
+│  Kaggle 49k (full history)       eloratings.net (daily ELO)               │
+└──────────┬──────────────────────────────┬───────────────────────┘
+           ▼                              ▼
+┌─────────────────────┐   ┌──────────────────────────────┐
+│  scripts/elo_etl.py │   │  scripts/etl_pipeline.py      │
+│  elo_ratings table     │   │  matches/tournaments/teams tables          │
+└──────────┬──────────┘   └──────────────┬───────────────┘
+           │                             │
+           ▼                             ▼
+┌────────────────────────────────────────────────────────────────┐
+│                    db/ — SQLAlchemy Data Layer                       │
+│  reader.py (match query)   elo_reader.py (ELO query)   config.py     │
+│  models.py (ORM)           etl.py (ETL core)                         │
+└────────────────────────────────────┬───────────────────────────┘
+                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            models/bayesian_dixon_coles.py — Core Engine             │
+│                                                                 │
+│  fit()  PyMC find_MAP (autodiff+ZeroSumNormal)                  │
+│    ├── ELO vector (db.elo_reader) → anchor prior mean            │
+│    ├── 1y momentum (db.elo_reader) → mom_att/mom_def             │
+│    ├── ConfederationPrior (7 confeds) → mu_conf_att/def          │
+│    ├── τ correction (Dixon-Coles low-score dependence)            │
+│    └── sequential decay weight (damping=0.002) × competition weight │
+│                                                                 │
+│  predict() generate score matrix → aggregate 1X2                 │
+│    ├── FlexibleScoreModel(NB+Frank+diagonal inflation)            │
+│    ├── DynamicStrengthFilter (process_sd tuning)                  │
+│    └── ScoreMatrixCalibrator (temperature+draw calibration)       │
+└────────────────────────────────────┬───────────────────────────┘
+                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            models/quantbet/scoreline/ — v8 Score Engine              │
+│  count_dists.py     NB(r) / Weibull(c) / Poisson               │
+│  bivariate.py       Frank copula / bivariate Poisson / diagonal inflation         │
+│  score_model.py     FlexibleScoreModel (assembly of above components)            │
+│  dynamic_strength.py  EKF strength filter (Koopman-Lit 2015)          │
+│  calibration.py     temperature+draw inflation calibration                            │
+└────────────────────────────────────────────────────────────────┘
+                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            models/quantbet/worldcup/ — World Cup Expansion                │
+│  rating_prior.py         ELO/BT anchored prior                        │
+│  confederation_prior.py  continental partial-pooling                   │
+│  knockout.py             extra time + penalty advancement probability                     │
+│  tournament.py           48-team MC simulation (2026 format)                  │
+│  trps.py                 wTRPS tournament scoring                         │
+│  laplace_propagation.py posterior uncertainty propagation                        │
+└────────────────────────────────────┬───────────────────────────┘
+                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            api/ — FastAPI REST Interface (production security)                    │
+│  server.py          Bearer Token + Rate Limiting + Security Headers              │
+│  routes.py          /matches /teams /tournaments                │
+│  schemas.py         Pydantic response models                            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Directory Structure
+
+```
+quantbet_ev/
+├── api/                     # FastAPI REST API
+│   ├── server.py            # Entry + Security Middleware + Unified Error Handling
+│   ├── routes.py            # /matches, /teams, /tournaments
+│   ├── schemas.py           # Pydantic Response Models
+│   └── dependencies.py      # SQLAlchemy session injection
+│
+├── db/                      # Data Access Layer
+│   ├── config.py            # Database Config (SQLite/PostgreSQL)
+│   ├── models.py            # SQLAlchemy ORM (5 tables)
+│   ├── reader.py            # Training Data Reading + competition mapping
+│   ├── elo_reader.py        # ELO Rating Read (normalized vector)
+│   ├── etl.py               # CSV/API ETL Core
+│   └── migrations/          # Alembic + init.sql
+│
+├── models/                  # Prediction Engine
+│   ├── bayesian_dixon_coles.py  ← Main Model (v9)
+│   ├── dixon_coles.py       # MLE Classic (retained)
+│   ├── ml_predictor.py      # GBM + Ensemble (v7.5 fix)
+│   │
+│   ├── quantbet/            # Enhancement Package
+│   │   ├── devig.py         # Shin De-vig
+│   │   ├── pooling.py       # Log Pooling
+│   │   ├── portfolio.py     # Risk-constrained Kelly
+│   │   ├── staking.py       # Kelly / Posterior Lower Quantile
+│   │   ├── posterior.py     # Laplace Posterior
+│   │   ├── markets.py       # Market Predicates + Joint Probability
+│   │   ├── evaluation.py    # bootstrap CI + CLV
+│   │   │
+│   │   ├── scoreline/       # v8 Score Engine (NB+Frank)
+│   │   │   ├── count_dists.py
+│   │   │   ├── bivariate.py
+│   │   │   ├── score_model.py
+│   │   │   ├── dynamic_strength.py
+│   │   │   └── calibration.py
+│   │   │
+│   │   └── worldcup/        # v9 World Cup Expansion
+│   │       ├── rating_prior.py
+│   │       ├── confederation_prior.py
+│   │       ├── confederations.py
+│   │       ├── knockout.py
+│   │       ├── tournament.py
+│   │       ├── trps.py
+│   │       └── laplace_propagation.py
+│   │
+│   ├── v7_pipeline.py       # v7 End-to-end Pipeline
+│   └── worldcup_model.py    # Legacy (retained)
+│
+├── scripts/                 # Utility Scripts
+│   ├── elo_etl.py           # ELO Scrape → SQL (daily)
+│   ├── elo_fetcher.py       # ELO Raw Fetch (cache)
+│   ├── etl_pipeline.py      # Match Data ETL
+│   └── ...
+│
+├── tests/                   # Tests
+│   ├── test_ml_predictor_temporal.py  # Temporal Correctness
+│   ├── test_worldcup_smoke.py         # World Cup Module Smoke Test
+│   ├── benchmark_scoreline.py         # Score Engine Comparison
+│   ├── full_49k_benchmark.py          # Full Dataset Benchmark
+│   └── conftest.py                    # In-memory SQLite Isolation
+│
+└── data/                    # Cache (gitignored)
+    └── elo_ratings.json     # ELO Rating Snapshot (daily generated)
+```
+
+---
+
+## 3. Core Algorithm
+
+### 3.1 Log-Linear Poisson Base
+
+```
+log(λ_h) = att[home] + def[away] + venue_adj
+log(λ_a) = att[away] + def[home]
+  λ_h, λ_a = exp(clip(log_λ, -10, 10))
+```
+
+### 3.2 v9 Prior Hierarchy (Core Innovation)
+
+```
+att_i = mu_conf(conf(i)) + η_att × ELO_z(i) + mom_att × mom_1y_z(i) + att_noise_i
+def_i = mu_conf(conf(i)) + η_def × ELO_z(i) + mom_def × mom_1y_z(i) + def_noise_i
+
+mu_conf ~ ZeroSumNormal(τ)         ← 7 confederation means (ConfederationPrior)
+ELO_z   ~ z-score(eloratings)      ← cross-confederation comparable rating (daily updated)
+mom_1y_z ~ z-score(1y ELO change)     ← 1-year momentum
+att_noise, def_noise ~ ZeroSumNormal(σ)  ← residual parameters
+
+Prior Hyperparams: η_att η_def ~ N(0,1)      ← ELO slope
+          mom_att mom_def ~ N(0,0.5)  ← momentum slope
+          τ_att τ_def ~ HalfNormal(1)  ← confederation variance
+          σ_att σ_def ~ HalfNormal(1)  ← noise variance
+```
+
+### 3.3 Dixon-Coles τ Correction
+
+```
+τ(g_h, g_a) = 1 - λ_h λ_a ρ     (0-0)
+              1 + λ_a ρ          (1-0)
+              1 + λ_h ρ          (0-1)
+              1 - ρ              (1-1)
+              1                  (other)
+ρ ~ N(0, 0.15), ρ ∈ (-0.99, 0.99)
+```
+
+### 3.4 Weight System
+
+```
+w_i = exp(-0.002 × days_ago_i) × competition_weight_i
+
+Competition Weights:
+  World Cup Finals        1.00
+  World Cup Qualifiers    0.85
+  Continental Championship 0.85
+  Continental Qualifiers  0.70
+  UEFA Nations League     0.60
+  Friendlies              0.35
+```
+
+### 3.5 NB+Frank Score Matrix (v8)
+
+```
+Step 1: NB(r=8) marginal — generate 11x1 PVF for λ_h, λ_a each
+        Release Poisson's Var=μ constraint, allow overdispersion
+Step 2: Frank copula(κ=0.17) — impose weak negative dependence
+        C(u,v) = -(1/κ)ln(1 + (e^{-κu}-1)(e^{-κv}-1)/(e^{-κ}-1))
+Step 3: Diagonal inflation — θ_draw calibrates draw diagonal
+Step 4: Normalize to ΣP = 1
+```
+
+### 3.6 Dynamic Strength Filter (v9, Koopman-Lit 2015)
+
+```
+State: (att_i, def_i) Gaussian belief N(m_i, P_i)
+Evolution: m ← μ_prior + φ·(m − μ_prior), P ← φ²·P + σ_w²·Δdays
+Update: λ = exp(att_h + def_a + venue)
+      P_post = 1/(1/P + λ), m_post = m + P_post·(g − λ)
+Tuning: tune_process_sd selects σ_w on validation set (candidates include 0.0, falls back to static)
+```
+
+### 3.7 Temperature Calibration (v9)
+
+```
+Validation set joint optimization (log-temperature, logit-θ_draw):
+  min (1-w)·RPS + w·logLoss(exact score)
+Calibration: M' = M^{1/temp} / Σ → diagonal_inflate
+```
+
+### 3.8 MAP Optimization
+
+```
+Method: PyMC find_MAP (autodiff, not SLSQP)
+Constraint: ZeroSumNormal(∑att=0, ∑def=0) built-in
+Priors: 7 items (att, def, ρ, home, neutral, log σ_att, log σ_def)
+       + 2 items (eta_att, eta_def)
+       + 2 items (mom_att, mom_def)
+       + 2 items (τ_att, τ_def)
+       + 2×6 items (mu_conf_att × 6, mu_conf_def × 6)
+Total DOF: 2×336 + 3 + 2 + 2 + (7-1)×2 = 699
+```
+
+### 3.9 Evaluation System
+
+```
+RPS = ½Σ(cumsum(p)-cumsum(a))²      (per match 1X2)
+wTRPS = weighted_RPS(7 buckets)      (tournament)
+bootstrap CI on ΔRPS                (paired test)
+```
+
+---
+
+## 4. Data Flow
+
+### 4.1 Training Pipeline
+
+```
+python scripts/elo_etl.py              # Scrape ELO → SQL (daily)
+python tests/train_v7_pymc.py          # fit() → v9.pkl
+
+fit() internals:
+  1. SQL pull 49k matches + ELO ratings
+  2. Confederation labels (AFC/CAF/CONCACAF/CONMEBOL/OFC/UEFA/Other)
+  3. PyMC find_MAP → 699 parameters
+  4. DynamicStrengthFilter.tune_process_sd (val 20%)
+  5. ScoreMatrixCalibrator.fit (val 20%)
+  6. Save pkl
+```
+
+### 4.2 Prediction Pipeline
+
+```
+predict(home, away, venue):
+  1. λ_h = exp(clip(att[home] + def[away] + venue_adj, -10, 10))
+  2. λ_a = exp(clip(att[away] + def[home], -10, 10))
+  3. FlexibleScoreModel.score_matrix(λ_h, λ_a) → NB+Frank 11×11
+  4. Calibrator.transform → temperature scaling + diagonal inflation
+  5. Normalize → 1X2 + Top12 scores
+```
+
+### 4.3 Tournament Simulation (worldcup/tournament.py)
+
+```
+48 teams → 12 groups × 4 → group stage (points/GD/GF/rng) 
+  → 8 best 3rd-placed → R32 → R16 → QF → SF → Final
+  → 50,000 MC runs → advancement probability + championship probability
+```
+
+---
+
+## 5. Current Model Parameters
+
+| Metric | v7 (SLSQP) | v9 (PyMC+ELO+Conf) |
+|---|---|---|
+| Training Data | 5,694 matches (5yr) | 49,405 matches OOF |
+| Teams | 255 | 336 |
+| LL | -15,691 | **-161,603** |
+| AIC | 32,436 | 324,589 |
+| rho | -0.067 | -0.070 |
+| home_adj | 0.303 | 0.270 |
+| σ_att | 0.580 | **0.292** (tighter prior) |
+| σ_def | 0.626 | **0.325** |
+| η_att | — | +0.553 (strong ELO signal) |
+| η_def | — | -0.558 |
+| mom_att | — | +0.028 (weak) |
+| process_sd | — | 0.25 (weak dynamic) |
+| Calibration temp | — | 0.846 |
+| Training time | 6s | 121s |
+
+---
+
+## 6. Deployment & Security
+
+### 6.1 Environment Separation
+
+| Mode | Database | Command |
+|---|---|---|
+| Development (SQLite) | `quantbet.db` | `uvicorn api.server:app --reload` |
+| Development (Docker) | SQLite mount | `docker compose up` |
+| Production (Docker) | PostgreSQL | `docker compose -f docker-compose.yml up` |
+| Test | In-memory SQLite | `pytest` |
+
+### 6.2 Security Layer
+
+- Bearer Token Auth (`API_TOKEN` env var)
+- CORS Whitelist (`localhost` only)
+- Rate Limiting (60 requests/min/IP)
+- Security Response Headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
+- Unified Error Handling (no stack leak, no user input reflection)
+- Log Sanitization (no token logging)
+- SQL Injection Defense (parameterized queries across all layers)
+
+### 6.3 Docker Deployment
+
+```yaml
+services:
+  db:    postgres:16-alpine, healthcheck, init.sql
+  api:   python:3.13-slim, uvicorn → port 8000
+```
+
+---
+
+## 7. Module Dependency Graph
+
+```
+bayesian_dixon_coles.py
+├── pymc (find_MAP + ZeroSumNormal)
+├── pytensor (autodiff)
+├── numpy/scipy
+├── db/elo_reader.py
+│   └── db/config.py
+├── quantbet/scoreline/
+│   ├── score_model.py
+│   │   ├── count_dists.py (NB/Weibull/Poisson)
+│   │   └── bivariate.py (Frank copula / diagonal inflation)
+│   ├── dynamic_strength.py
+│   └── calibration.py
+└── quantbet/worldcup/
+    ├── rating_prior.py
+    ├── confederation_prior.py
+    └── confederations.py
+
+scripts/elo_etl.py
+├── requests (eloratings.net/World.tsv)
+├── db/config.py → elo_ratings table
+└── sqlalchemy upsert
+
+api/server.py
+├── fastapi + uvicorn
+├── api/routes.py → db/reader.py (SQL)
+└── CORSMiddleware + SecurityMiddleware
+
+docker-compose.yml
+├── postgres:16-alpine
+└── Dockerfile (python:3.13-slim)
+```
+
+---
+
+## 8. CLI Quick Reference
+
+```bash
+# Data
+python scripts/elo_etl.py                # Update ELO ratings
+python scripts/etl_pipeline.py --source csv --file /path/results.csv
+
+# Training
+python tests/train_v7_pymc.py            # Full 49k + Dynamic + Calibration
+
+# API
+uvicorn api.server:app --reload
+curl localhost:8000/matches?team=Germany&from=2026-01-01
+
+# Prediction (one-liner)
+python -c "import sys,pickle;sys.path.insert(0,'models');\
+dc=pickle.load(open('models/bayesian_dc_v9.pkl','rb'));\
+r=dc.predict('Germany','Japan','neutral');\
+print(f'H={r[\"home_win_prob\"]*100:.1f}% D={r[\"draw_prob\"]*100:.1f}% A={r[\"away_win_prob\"]*100:.1f}%')"
+
+# SQL Query
+python -c "
+from sqlalchemy import create_engine,text;from db.config import DATABASE_URL,ENGINE_KWARGS
+e=create_engine(DATABASE_URL,**ENGINE_KWARGS)
+with e.connect() as c:
+    print(c.execute(text('SELECT team_name,rating,rating_chg_1y FROM elo_ratings ORDER BY rating DESC LIMIT 10')).fetchall())
+"
+```
+
+---
+
+## 9. Paper Index
+
+| Citation | Module | Application |
+|---|---|---|
+| Dixon & Coles (1997) | τ correction | Low-score dependence parameter ρ |
+| Boshnakov, Kharrat & McHale (2017) | scoreline/ | NB marginal + Frank copula |
+| Karlis & Ntzoufras (2003) | bivariate.py | Diagonal inflation |
+| Koopman & Lit (2015) | dynamic_strength.py | Time-varying strength state space |
+| Groll et al. (2018, 2024) | rating_prior, knockout | ELO prior + ET+penalties |
+| Rue & Salvesen (2000) | Dynamic filter | OU mean reversion |
+| Macri-Demartino et al. (2024) | confederation_prior | BT-Davidson + continental |
+| Ekstrom et al. (2021) | trps | Tournament wTRPS |
+| Busseti-Ryu-Boyd (2016) | portfolio | Risk-constrained Kelly |
+| Shin (1992/1993) | devig | De-vig |
+| Genest-Zidek (1986) | pooling | Log pooling |
+| Ranjan-Gneiting (2010) | pooling | Log pooling reference |
+| Pollard & Pollard (2005) | Venue prior | home_adj ~ N(0.25, 0.20) |
+| Gelman et al. (2013) BDA3 | Hierarchical prior | sigma hyperprior + partial-pooling |
